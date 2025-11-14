@@ -1,0 +1,703 @@
+---
+title: "NEL Pharmacy Outcomes Dashboard"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: scroll
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(sf)
+library(leaflet)
+library(dplyr)
+library(RColorBrewer)
+library(htmlwidgets)
+library(classInt)
+library(shiny)
+library(DT)
+library(ggplot2)
+
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+```{r processing, include=FALSE}
+# Set working directory - CHANGE THIS TO YOUR PATH
+# setwd("C:/Users/matteo.mazzeri/OneDrive - NHS/Desktop/GIS Projects/PharmaOutcomes")
+
+# Load data ----------------------------------------------------------------
+hub_lines <- st_read("data/Hub_Lines.geojson")
+imd <- st_read("Web maps/IMD Quintile by MSOA.geojson")
+postal_district <- st_read("data/activity_post_dist.geojson")
+activity_pharmacy <- st_read("data/activity_by_pharmacy.geojson")
+boroughs_nel <- st_read("data/NEL boundaries.geojson")
+post_dist_zero_act <- st_read('data/Zero Activity Post Dist.geojson')
+zero_activity_pharmacies <- st_read("Data/Zero_activity_pharmacy.csv.geojson")
+pharmacy_table <- read.csv("Data/pharmacy_tab_dashbrd.csv", stringsAsFactors = FALSE)
+trend_table <- read.csv("Data/trend_dashbrd.csv", stringsAsFactors = FALSE)
+
+
+# Load the breakdown data
+type_breakdown <- read.csv("data/type_breakdown.csv")
+
+# Summarize activity breakdown by ODSCode and Type
+type_summary <- type_breakdown %>%
+  group_by(ODSCode, Type) %>%
+  summarise(PatientLinkID = sum(PatientLinkID), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = Type, values_from = PatientLinkID, values_fill = 0)
+
+# Join the summary to activity_pharmacy by matching Pharmacy Code with ODSCode
+activity_pharmacy <- activity_pharmacy %>%
+  left_join(type_summary, by = c("PharmacyCode" = "ODSCode"))
+
+# -------------------------------------------------------------------------
+# 1. HUB LINES CONFIGURATION
+# -------------------------------------------------------------------------
+hub_breaks <- c(1, 15, 49, 131, 281, 495)
+hub_labels <- c("1–15", "15–49", "49–131", "131–281", "281–495")
+hub_sizes  <- c(1, 4, 7, 9, 12) 
+
+hub_lines <- hub_lines %>%
+  mutate(
+    bin  = cut(PatientLinkID, breaks = hub_breaks, labels = hub_labels, include.lowest = TRUE),
+    size = case_when(
+      bin == hub_labels[1] ~ hub_sizes[1],
+      bin == hub_labels[2] ~ hub_sizes[2],
+      bin == hub_labels[3] ~ hub_sizes[3],
+      bin == hub_labels[4] ~ hub_sizes[4],
+      bin == hub_labels[5] ~ hub_sizes[5]
+    )
+  )
+
+# Single color with varying opacity for hub lines
+hub_opacities <- c(0.2, 0.4, 0.6, 0.8, 1.0)  # Light to dark opacity
+
+hub_lines <- hub_lines %>%
+  mutate(
+    opacity_level = case_when(
+      bin == hub_labels[1] ~ hub_opacities[1],
+      bin == hub_labels[2] ~ hub_opacities[2],
+      bin == hub_labels[3] ~ hub_opacities[3],
+      bin == hub_labels[4] ~ hub_opacities[4],
+      bin == hub_labels[5] ~ hub_opacities[5]
+    )
+  )
+
+# -------------------------------------------------------------------------
+# 2. IMD QUINTILES CONFIGURATION
+# -------------------------------------------------------------------------
+# Convert to factor with descriptive labels
+imd$MSOAQUINTI <- factor(imd$MSOAQUINTI,
+                         levels = 1:5,
+                         labels = c("1 (Most Deprived)", "2", "3", "4", "5 (Least Deprived)"))
+
+# Create color palette
+imd_colors <- rev(c("#FDE725", "#5DC863", "#21908C", "#3B528B", "#440154"))
+imd_pal <- colorFactor(imd_colors, domain = imd$MSOAQUINTI)
+
+# -------------------------------------------------------------------------
+# 3. POSTAL DISTRICTS & PHARMACY SIZING
+# -------------------------------------------------------------------------
+# Postal Districts with Jenks breaks
+pd_breaks <- classIntervals(postal_district$PatientLinkID, n = 5, style = "jenks")$brks
+pd_labels <- paste(head(pd_breaks, -1), "-", tail(pd_breaks, -1))
+pd_sizes  <- c(4, 8, 12, 16, 20)  # radii for your circles
+
+postal_district <- postal_district %>%
+  mutate(
+    pd_bin  = cut(PatientLinkID, breaks = pd_breaks, labels = pd_labels, include.lowest = TRUE),
+    circle_size = case_when(
+      pd_bin == pd_labels[1] ~ pd_sizes[1],
+      pd_bin == pd_labels[2] ~ pd_sizes[2],
+      pd_bin == pd_labels[3] ~ pd_sizes[3],
+      pd_bin == pd_labels[4] ~ pd_sizes[4],
+      pd_bin == pd_labels[5] ~ pd_sizes[5]
+    )
+  )
+
+# Pharmacies with Jenks breaks
+ph_breaks <- classIntervals(activity_pharmacy$PatientLinkID, n = 5, style = "jenks")$brks
+ph_labels <- paste(head(ph_breaks, -1), "-", tail(ph_breaks, -1))
+ph_sizes  <- c(10, 15, 20, 25, 30)
+
+activity_pharmacy <- activity_pharmacy %>%
+  mutate(
+    ph_bin  = cut(PatientLinkID, breaks = ph_breaks, labels = ph_labels, include.lowest = TRUE),
+    diamond_size = case_when(
+      ph_bin == ph_labels[1] ~ ph_sizes[1],
+      ph_bin == ph_labels[2] ~ ph_sizes[2],
+      ph_bin == ph_labels[3] ~ ph_sizes[3],
+      ph_bin == ph_labels[4] ~ ph_sizes[4],
+      ph_bin == ph_labels[5] ~ ph_sizes[5]
+    )
+  )
+
+# -------------------------------------------------------------------------
+# 4. DIAMOND ICON GENERATOR
+# -------------------------------------------------------------------------
+diamond_icon <- function(size = 15, color = "green", opacity = 0.7) {
+  svg <- paste0(
+    '<svg width="', size, '" height="', size, '" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">',
+    '<polygon points="50,0 100,50 50,100 0,50" fill="', color, '" opacity="', opacity, '" stroke="white" stroke-width="2"/>',
+    '</svg>'
+  )
+  makeIcon(
+    iconUrl     = paste0("data:image/svg+xml;base64,", base64enc::base64encode(charToRaw(svg))),
+    iconWidth   = size,
+    iconHeight  = size,
+    iconAnchorX = size / 2,
+    iconAnchorY = size / 2
+  )
+}
+
+# -------------------------------------------------------------------------
+# 6. CREATE DYNAMIC LEGEND HTML
+# -------------------------------------------------------------------------
+
+# Create postal district legend HTML with actual break values
+postal_legend_html <- paste0(
+  '<div id="postal_legend" style="font-size:9px; line-height:1.2; display:none;">',
+  '<strong style="font-size:10px;">Activity by Postal District</strong>',
+  '<div style="margin-top:2px;">',
+  paste0(
+    '<div style="display:flex; align-items:center; margin:1px 0;">',
+    '<span style="display:inline-block; width:', pd_sizes * 1.5, 'px; height:', pd_sizes * 1.5,
+    'px; border-radius:50%; background:#c994c7; margin-right:4px;"></span>',
+    round(head(pd_breaks, -1)), ' - ', round(tail(pd_breaks, -1)),
+    '</div>',
+    collapse = ''
+  ),
+  '</div></div>'
+)
+
+# Create hub lines legend HTML with compact styling
+hub_legend_html <- paste0(
+  '<div id="lines_legend" style="font-size:9px; line-height:1.2; display:none;">',
+  '<strong style="font-size:10px;">Patients per Line</strong>',
+  '<div style="margin-top:2px;">',
+  paste0(
+    '<div style="display:flex; align-items:center; margin:1px 0;">',
+    '<span style="display:inline-block; width:16px; height:', hub_sizes, 
+    'px; background:#e34a33; opacity:', hub_opacities, '; margin-right:4px;"></span>',
+    hub_labels,
+    '</div>',
+    collapse = ''
+  ),
+  '</div></div>'
+)
+
+# Create pharmacy legend HTML with compact styling
+pharmacy_legend_html <- paste0(
+  '<div id="pharmacy_legend" style="font-size:9px; line-height:1.2; display:none;">',
+  '<strong style="font-size:10px;">Activity by Pharmacies</strong>',
+  '<div style="margin-top:2px;">',
+  paste0(
+    '<div style="display:flex; align-items:center; margin:1px 0;">',
+    '<svg width="', ph_sizes * 0.75, '" height="', ph_sizes * 0.75, 
+    '" viewBox="0 0 100 100" style="margin-right:4px;">',
+    '<polygon points="50,0 100,50 50,100 0,50" fill="green"/></svg>',
+    round(head(ph_breaks, -1)), ' - ', round(tail(ph_breaks, -1)),
+    '</div>',
+    collapse = ''
+  ),
+  '</div></div>'
+)
+
+```
+
+## Row {style="height:120vh;"}
+
+### Map
+
+```{r}
+leafletOutput("myMap", height = "100%")
+```
+
+## Row {style="height:100vh;"}
+
+### Pharmacy Details
+
+```{r}
+### Pharmacy Details
+DT::dataTableOutput("pharmacy_table")
+```
+
+### Activity Trend
+
+```{r}
+plotOutput("pharmacy_trend", height = 250)
+```
+
+```{r server_logic}
+# Reactive value to store selected pharmacy
+selected_pharmacy <- reactiveVal(NULL)
+
+# Render the map (YOUR ORIGINAL CODE)
+output$myMap <- renderLeaflet({
+  
+  # ---- Create borough interior points for label placement ----
+  borough_pts <- sf::st_point_on_surface(boroughs_nel) 
+  
+  my_map <- leaflet() %>%
+    addProviderTiles("Esri.WorldGrayCanvas") %>%
+    addPolygons(
+      data = boroughs_nel,
+      color = "#666666", weight = 1.5,
+      fillColor = "#cccccc", fillOpacity = 0.2, opacity = 1,
+      options = pathOptions(interactive = FALSE),  # keep them non-blocking
+      group = "Boroughs"
+    ) %>%
+    
+    # 2) Borough labels (centered, subtle grey, non-interactive)
+    addLabelOnlyMarkers(
+      data = borough_pts,
+      label = ~lad20nm,
+      labelOptions = labelOptions(
+        noHide = TRUE,
+        textOnly = TRUE,
+        direction = "center",
+        className = "borough-label"
+      ),
+      group = "Boroughs"
+    ) %>%
+    
+    # IMD polygons below
+    addPolygons(
+      data = imd,
+      fillColor = ~imd_pal(MSOAQUINTI),
+      fillOpacity = 0.6,
+      color = "#444444",
+      weight = 0.3,
+      group = "IMD Quintiles",
+      options = pathOptions(interactive = FALSE)
+    ) %>% 
+    
+    # Add Hub lines
+    addPolylines(
+      data = hub_lines,
+      weight = ~size,
+      color = "#e34a33",  # Single color for all lines
+      opacity = ~opacity_level,  # Varying opacity based on value
+      label = ~paste("Patients:", PatientLinkID),
+      group = "Hub Lines"
+    ) %>%
+    
+    # Add Postal District circle markers
+    addCircleMarkers(
+      data = postal_district,
+      radius = ~circle_size,
+      fillColor = "#c994c7",
+      fillOpacity = 0.7,
+      color = "#ffffff",
+      weight = 1,
+      popup = ~paste0("<strong>Postal District: </strong>", PostDist,
+                      "<br><strong>Locale: </strong>", ifelse(is.na(Locale), "Unknown", Locale),
+                      "<br><strong>Patient Count: </strong>", PatientLinkID),
+      group = "Postal Districts"
+    ) %>%
+    
+    # Add Zero Activity Postal Districts (small red circles)
+    addCircleMarkers(
+      data = post_dist_zero_act,
+      radius = 4,
+      fillColor = "#ff0000",
+      fillOpacity = 0.7,
+      color = "#ffffff",
+      weight = 1,
+      popup = ~paste0(
+        "<strong>Zero Activity District: </strong>", PostDist,
+        "<br><strong>Status: </strong>No Activity"
+      ),
+      group = "Zero Activity Districts"
+    )
+  
+  # Add Pharmacy Diamond Icons with simple popups -------------------------
+  for (i in seq_len(nrow(activity_pharmacy))) {
+    coords <- st_coordinates(activity_pharmacy[i, ])
+    popup_content <- paste0(
+      "<strong>Pharmacy: </strong>", activity_pharmacy$Pharmacy.Name[i], "<br>",
+      "<strong>Activity: </strong>", activity_pharmacy$PatientLinkID[i], "<br>",
+      "<strong>GP Referral: </strong>", activity_pharmacy$`GP Referral`[i], "<br>",
+      "<strong>Walk In: </strong>", activity_pharmacy$`Walk In`[i]
+    )
+    my_map <- my_map %>%
+      addMarkers(
+        lng   = coords[1],
+        lat   = coords[2],
+        icon = diamond_icon(activity_pharmacy$diamond_size[i], "green"),
+        popup = popup_content,
+        layerId = activity_pharmacy$PharmacyCode[i],  # ADDED: for click detection
+        group = "Pharmacy Activity"
+      )
+  }
+  
+  # Add Zero Activity Pharmacy Diamond Icons -------------------------------
+  for (i in seq_len(nrow(zero_activity_pharmacies))) {
+    coords <- st_coordinates(zero_activity_pharmacies[i, ])
+    my_map <- my_map %>%
+      addMarkers(
+        lng   = coords[1],
+        lat   = coords[2],
+        icon = diamond_icon(9, "red", 0.7),
+        popup = paste0("<strong>Pharmacy: </strong>", zero_activity_pharmacies$Pharmacy.Name[i]),
+        group = "Zero Activity Pharmacies"
+      )
+  }
+  
+  # -------------------------------------------------------------------------
+  # 7. ADD LEGENDS & CONTROLS
+  # -------------------------------------------------------------------------
+  my_map <- my_map %>%
+    # IMD legend
+    addLegend(
+      position = "bottomright",
+      pal = imd_pal,
+      values = imd$MSOAQUINTI,
+      title = "IMD Quintile",
+      opacity = 1,
+      layerId = "imd_legend"
+    ) %>%
+    
+    # Postal District legend (dynamic)
+    addControl(
+      html = postal_legend_html,
+      position = "topleft"
+    ) %>%
+    
+    # Hub Lines legend (dynamic)
+    addControl(
+      html = hub_legend_html,
+      position = "topleft"
+    ) %>%
+    
+    # Pharmacy legend (dynamic)
+    addControl(
+      html = pharmacy_legend_html,
+      position = "topleft"
+    ) %>%
+    
+    # Zero Activity Districts legend
+    addControl(
+      html = '<div id="zero_activity_post_legend" style="font-size:11px; display:none;">
+                <strong>Zero Activity Districts</strong>
+                <div style="margin-top:2px;">
+                  <div style="display:flex; align-items:center; margin:2px 0;"><span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#ff0000; opacity:0.7; border:1px solid #ffffff; margin-right:6px;"></span>No Activity</div>
+                </div>
+              </div>',
+      position = "bottomright"
+    ) %>%
+    
+    # Zero Activity Pharmacy legend
+    addControl(
+      html = '<div id="zero_activity_pharm_legend" style="font-size:11px; display:none;">
+              <strong>Zero Activity Pharmacies</strong>
+              <div style="margin-top:2px;">
+                <div style="display:flex; align-items:center; margin:2px 0;">
+                  <svg width="11" height="11" viewBox="0 0 100 100" style="margin-right:6px;">
+                    <polygon points="50,0 100,50 50,100 0,50" fill="red" opacity="0.7" stroke="white" stroke-width="1.25"/>
+                  </svg>
+                  No Activity
+                </div>
+              </div>
+            </div>',
+      position = "bottomright"
+    ) %>% 
+    
+    # Layer controls
+    addLayersControl(
+      position = "topright",
+      overlayGroups = c("IMD Quintiles", "Hub Lines", "Postal Districts", 
+                        "Pharmacy Activity", "Zero Activity Districts",
+                        "Zero Activity Pharmacies"
+      ),
+      options = layersControlOptions(collapsed = FALSE)
+    )
+  
+  # ---- JavaScript: styling + legend show/hide ----
+ my_map <- my_map %>% htmlwidgets::onRender("
+    function(el, x) {
+      var map = this;
+  
+      // CSS per etichette borough (subtle grey, centered, readable) e legende
+      var style = document.createElement('style');
+      style.innerHTML = `
+      
+      .leaflet-control-zoom a {
+        width: 18px !important;
+        height: 18px !important;
+        line-height: 16px !important;
+        font-size: 14px !important;
+      }
+      .leaflet-control-zoom {
+        border: none !important;
+        box-shadow: 0 1px 4px rgba(60,60,60,0.2) !important;
+      }
+      
+        .leaflet-tooltip.borough-label {
+          pointer-events: none;
+          background: transparent;
+          border: none;
+          box-shadow: none;
+          font-size: 20px;
+          font-weight: 600;
+          color: #595959;
+          letter-spacing: 0.5px;
+          text-shadow:
+            0 0 2px rgba(255,255,255,0.7),
+            0 0 4px rgba(255,255,255,0.5);
+        }
+      
+        #postal_legend, #lines_legend, #pharmacy_legend, 
+          #zero_activity_post_legend, #zero_activity_pharm_legend {
+            font-size: 9px;
+            line-height: 1.1;
+            padding: 4px 6px;
+            margin-bottom: 4px;
+            background: rgba(255,255,255,0.88);
+            border-radius: 4px;
+            box-shadow: 0 1px 4px rgba(60,60,60,0.08);
+          }
+      
+        .leaflet-top.leaflet-right .leaflet-control-layers {
+          font-size: 11px;
+          min-width: 118px;
+          padding: 4px 8px;
+        }
+      
+        .leaflet-control-layers-toggle {  
+          width: 26px !important; 
+          height: 26px !important;
+        }
+      
+        .leaflet-control-layers-overlays label,
+        .leaflet-control-layers-base label {
+          font-size: 11px;
+          margin: 0 0 2px 0;
+        }
+        
+        .leaflet .legend {
+          font-size: 9px !important;
+          line-height: 18px !important;
+          padding: 4px 6px !important;
+          background: rgba(255,255,255,0.88) !important;
+          border-radius: 4px !important;
+          box-shadow: 0 1px 4px rgba(60,60,60,0.08) !important;
+          max-width: 145px !important;   /* Optionally control width */
+        }
+        
+        .leaflet .legend i {
+          width: 18px !important;
+          height: 18px !important;
+          margin-right: 5px !important;
+        }
+
+      `;
+
+      document.head.appendChild(style);
+
+  
+      // Funzioni helper per mostrare/nascondere legende
+      function toggleLegend(legendId, isVisible) {
+        var legend = document.getElementById(legendId);
+        if (legend) legend.style.display = isVisible ? 'block' : 'none';
+      }
+  
+      function toggleIMDLegend(isVisible) {
+        var legends = document.querySelectorAll('.info.legend');
+        legends.forEach(function(legend) {
+          if (legend.innerHTML.includes('IMD')) {
+            legend.style.display = isVisible ? 'block' : 'none';
+          }
+        });
+      }
+  
+      // Stato iniziale: tutte le legende visibili
+      toggleIMDLegend(false);
+      toggleLegend('postal_legend', true);
+      toggleLegend('lines_legend', true);
+      toggleLegend('pharmacy_legend', true);
+      toggleLegend('zero_activity_post_legend', false);
+      toggleLegend('zero_activity_pharm_legend', false);
+  
+      // Gestione eventi on/off dei layer
+      map.on('overlayadd', function(e) {
+        switch(e.name) {
+          case 'IMD Quintiles': toggleIMDLegend(true); break;
+          case 'Postal Districts': toggleLegend('postal_legend', true); break;
+          case 'Hub Lines': toggleLegend('lines_legend', true); break;
+          case 'Pharmacy Activity': toggleLegend('pharmacy_legend', true); break;
+          case 'Zero Activity Districts': toggleLegend('zero_activity_post_legend', true); break;
+          case 'Zero Activity Pharmacies': toggleLegend('zero_activity_pharm_legend', true); break;
+        }
+      });
+  
+      map.on('overlayremove', function(e) {
+        switch(e.name) {
+          case 'IMD Quintiles': toggleIMDLegend(false); break;
+          case 'Postal Districts': toggleLegend('postal_legend', false); break;
+          case 'Hub Lines': toggleLegend('lines_legend', false); break;
+          case 'Pharmacy Activity': toggleLegend('pharmacy_legend', false); break;
+          case 'Zero Activity Districts': toggleLegend('zero_activity_post_legend', false); break;
+          case 'Zero Activity Pharmacies': toggleLegend('zero_activity_pharm_legend', false); break;
+        }
+      });
+    }
+  ")
+
+  
+  my_map <- my_map %>%
+    hideGroup("IMD Quintiles") %>%
+    hideGroup("Zero Activity Districts") %>% 
+    hideGroup("Zero Activity Pharmacies")
+  
+  my_map <- my_map %>%
+    setView(lng = 0.085, lat = 51.56, zoom=11)
+  
+  return(my_map)
+})
+
+# Observe marker clicks (NEW: for table/plot filtering)
+observeEvent(input$myMap_marker_click, {
+  click <- input$myMap_marker_click
+  if (!is.null(click$id)) {
+    selected_pharmacy(click$id)
+    print(paste("Selected pharmacy:", click$id))  # For debugging
+  }
+})
+
+# Observe map clicks (not on markers) to deselect
+observeEvent(input$myMap_click, {
+  selected_pharmacy(NULL)
+  print("Deselected - showing all pharmacies")
+})
+
+# Observe map clicks (not on markers) to deselect
+observeEvent(input$myMap_click, {
+  selected_pharmacy(NULL)
+  print("Deselected - showing all pharmacies")
+})
+
+# Pharmacy table output
+output$pharmacy_table <- DT::renderDataTable({
+  sel <- selected_pharmacy()
+  if (is.null(sel)) {
+    # Show all pharmacies sorted by Total Activity in descending order
+    DT::datatable(
+      pharmacy_table %>% arrange(desc("Total.Activity")),
+       options = list(
+        pageLength = 5, 
+        scrollX = TRUE,
+        headerCallback = JS(
+          "function(thead, data, start, end, display) {",
+          "  $(thead).css('font-size', '11px');",  # Smaller column headers
+          "}"
+        )
+      ),
+      rownames = FALSE
+    ) %>% 
+      DT::formatStyle(columns = colnames(pharmacy_table), fontSize = '12px')
+  } else {
+    # Show only the selected pharmacy
+    DT::datatable(
+      pharmacy_table %>% filter(PharmacyCode == sel),
+      options = list(
+        pageLength = 5, 
+        scrollX = TRUE,
+        headerCallback = JS(
+          "function(thead, data, start, end, display) {",
+          "  $(thead).css('font-size', '11px');",  # Smaller column headers
+          "}"
+        )
+      ),
+      rownames = FALSE
+    ) %>% 
+      DT::formatStyle(columns = colnames(pharmacy_table), fontSize = '12px')
+  }
+})
+
+output$pharmacy_trend <- renderPlot({
+  sel <- selected_pharmacy()
+  
+  # Fix column names
+  names(trend_table) <- gsub("\\s+", ".", names(trend_table))
+  
+  # Filter data based on selection
+  if (is.null(sel)) {
+    df <- trend_table
+    show_all <- TRUE
+    plot_title <- "Quarterly Activity Trend: All Pharmacies"
+    plot_subtitle <- paste(length(unique(df$PharmacyCode)), "pharmacies")
+  } else {
+    df <- trend_table %>% filter(PharmacyCode == sel)
+    show_all <- FALSE
+    
+    # Get pharmacy name for title
+    pharmacy_name <- pharmacy_table %>% 
+      filter(PharmacyCode == sel) %>% 
+      pull(Pharmacy.Name) %>% 
+      head(1)
+    
+    plot_title <- ifelse(length(pharmacy_name) > 0, pharmacy_name, sel)
+    plot_subtitle <- "Quarterly Activity Trend"
+  }
+  
+  if (nrow(df) == 0) {
+    par(mar = c(0, 0, 0, 0))
+    plot.new()
+    text(0.5, 0.5, "No trend data available", 
+         cex = 1.3, col = "#666666")
+    return()
+  }
+  
+  # Ensure proper quarter ordering
+  df$Quarter <- factor(df$Quarter, levels = unique(df$Quarter[order(df$Quarter)]))
+  
+  # Create plot
+  if (show_all) {
+    # All pharmacies: semi-transparent lines, no legend
+    p <- ggplot(df, aes(x = Quarter, y = Quarterly.Activity, group = PharmacyCode)) +
+      geom_line(color = "#5271ff", linewidth = 0.6, alpha = 0.3) +
+      labs(
+        title = plot_title,
+        subtitle = plot_subtitle,
+        x = NULL,
+        y = "Activity Count"
+      )
+  } else {
+    # Single pharmacy: bold blue line
+    p <- ggplot(df, aes(x = Quarter, y = Quarterly.Activity, group = 1)) +
+      geom_line(color = "#5271ff", linewidth = 1.5) +
+      geom_point(color = "#5271ff", size = 4, shape = 21, fill = "white", stroke = 2) +
+      labs(
+        title = plot_title,
+        subtitle = plot_subtitle,
+        x = NULL,
+        y = "Activity Count"
+      )
+  }
+  
+  # Common theme
+  p <- p +
+    scale_y_continuous(labels = scales::comma) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title = element_text(size = 14, face = "bold", color = "#333333"),
+      plot.subtitle = element_text(size = 11, color = "#666666", margin = margin(b = 15)),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+      axis.text.y = element_text(size = 11),
+      axis.title.y = element_text(size = 12, face = "bold", margin = margin(r = 10)),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      plot.margin = margin(15, 15, 15, 15),
+      legend.position = "none"
+    )
+  
+  p <- p +
+  scale_x_discrete(limits = levels(df$Quarter), expand = c(0, 0))
+
+  
+  print(p)
+})
+
+```
