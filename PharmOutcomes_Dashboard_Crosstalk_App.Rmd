@@ -1,0 +1,651 @@
+---
+title: "NEL Pharmacy Outcomes Dashboard"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: scroll
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(sf)
+library(leaflet)
+library(dplyr)
+library(RColorBrewer)
+library(htmlwidgets)
+library(classInt)
+library(DT)
+library(crosstalk)
+library(plotly)
+library(htmltools)
+
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+# Load data ----------------------------------------------------------------
+hub_lines <- st_read("data/Hub_Lines.geojson")
+imd <- st_read("Web maps/IMD Quintile by MSOA.geojson")
+postal_district <- st_read("data/activity_post_dist.geojson")
+activity_pharmacy <- st_read("data/activity_by_pharmacy.geojson")
+boroughs_nel <- st_read("data/NEL boundaries.geojson")
+post_dist_zero_act <- st_read('data/Zero Activity Post Dist.geojson')
+zero_activity_pharmacies <- st_read("Data/Zero_activity_pharmacy.csv.geojson")
+pharmacy_table <- read.csv("Data/pharmacy_tab_dashbrd.csv", stringsAsFactors = FALSE)
+trend_table <- read.csv("Data/trend_dashbrd.csv", stringsAsFactors = FALSE)
+
+# Load the breakdown data
+type_breakdown <- read.csv("data/type_breakdown.csv")
+
+# Summarize activity breakdown by ODSCode and Type
+type_summary <- type_breakdown %>%
+  group_by(ODSCode, Type) %>%
+  summarise(PatientLinkID = sum(PatientLinkID), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = Type, values_from = PatientLinkID, values_fill = 0)
+
+# Join the summary to activity_pharmacy by matching Pharmacy Code with ODSCode
+activity_pharmacy <- activity_pharmacy %>%
+  left_join(type_summary, by = c("PharmacyCode" = "ODSCode"))
+
+# -------------------------------------------------------------------------
+# 1. HUB LINES CONFIGURATION
+# -------------------------------------------------------------------------
+hub_breaks <- c(1, 15, 49, 131, 281, 495)
+hub_labels <- c("1-15", "15-49", "49-131", "131-281", "281-495")
+hub_sizes  <- c(1, 4, 7, 9, 12) 
+
+hub_lines <- hub_lines %>%
+  mutate(
+    bin  = cut(PatientLinkID, breaks = hub_breaks, labels = hub_labels, include.lowest = TRUE),
+    size = case_when(
+      bin == hub_labels[1] ~ hub_sizes[1],
+      bin == hub_labels[2] ~ hub_sizes[2],
+      bin == hub_labels[3] ~ hub_sizes[3],
+      bin == hub_labels[4] ~ hub_sizes[4],
+      bin == hub_labels[5] ~ hub_sizes[5]
+    )
+  )
+
+# Single color with varying opacity for hub lines
+hub_opacities <- c(0.2, 0.4, 0.6, 0.8, 1.0)
+
+hub_lines <- hub_lines %>%
+  mutate(
+    opacity_level = case_when(
+      bin == hub_labels[1] ~ hub_opacities[1],
+      bin == hub_labels[2] ~ hub_opacities[2],
+      bin == hub_labels[3] ~ hub_opacities[3],
+      bin == hub_labels[4] ~ hub_opacities[4],
+      bin == hub_labels[5] ~ hub_opacities[5]
+    )
+  )
+
+# -------------------------------------------------------------------------
+# 2. IMD QUINTILES CONFIGURATION
+# -------------------------------------------------------------------------
+imd$MSOAQUINTI <- factor(imd$MSOAQUINTI,
+                         levels = 1:5,
+                         labels = c("1 (Most Deprived)", "2", "3", "4", "5 (Least Deprived)"))
+
+imd_colors <- rev(c("#FDE725", "#5DC863", "#21908C", "#3B528B", "#440154"))
+imd_pal <- colorFactor(imd_colors, domain = imd$MSOAQUINTI)
+
+# -------------------------------------------------------------------------
+# 3. POSTAL DISTRICTS & PHARMACY SIZING
+# -------------------------------------------------------------------------
+pd_breaks <- classIntervals(postal_district$PatientLinkID, n = 5, style = "jenks")$brks
+pd_labels <- paste(head(pd_breaks, -1), "-", tail(pd_breaks, -1))
+pd_sizes  <- c(4, 8, 12, 17, 22)
+
+postal_district <- postal_district %>%
+  mutate(
+    pd_bin  = cut(PatientLinkID, breaks = pd_breaks, labels = pd_labels, include.lowest = TRUE),
+    circle_size = case_when(
+      pd_bin == pd_labels[1] ~ pd_sizes[1],
+      pd_bin == pd_labels[2] ~ pd_sizes[2],
+      pd_bin == pd_labels[3] ~ pd_sizes[3],
+      pd_bin == pd_labels[4] ~ pd_sizes[4],
+      pd_bin == pd_labels[5] ~ pd_sizes[5]
+    )
+  )
+
+# Pharmacies with Jenks breaks
+ph_breaks <- classIntervals(activity_pharmacy$PatientLinkID, n = 5, style = "jenks")$brks
+ph_labels <- paste(head(ph_breaks, -1), "-", tail(ph_breaks, -1))
+ph_sizes  <- c(4, 8, 12, 16, 20)
+
+activity_pharmacy <- activity_pharmacy %>%
+  mutate(
+    ph_bin  = cut(PatientLinkID, breaks = ph_breaks, labels = ph_labels, include.lowest = TRUE),
+    circle_radius = case_when(
+      ph_bin == ph_labels[1] ~ ph_sizes[1],
+      ph_bin == ph_labels[2] ~ ph_sizes[2],
+      ph_bin == ph_labels[3] ~ ph_sizes[3],
+      ph_bin == ph_labels[4] ~ ph_sizes[4],
+      ph_bin == ph_labels[5] ~ ph_sizes[5]
+    )
+  )
+
+# -------------------------------------------------------------------------
+# 4. CREATE CROSSTALK SHARED DATA - PROPERLY INTEGRATED
+# -------------------------------------------------------------------------
+# Extract coordinates from activity_pharmacy for use in map
+activity_pharmacy_df <- activity_pharmacy %>%
+  mutate(
+    lng = st_coordinates(.)[,1],
+    lat = st_coordinates(.)[,2],
+    PharmacyCode = as.character(PharmacyCode)
+  ) %>%
+  st_drop_geometry()
+
+# Ensure PharmacyCode is consistent across all datasets
+pharmacy_table$PharmacyCode <- as.character(pharmacy_table$PharmacyCode)
+trend_table$PharmacyCode <- as.character(trend_table$PharmacyCode)
+
+# Create SharedData objects with consistent group
+shared_pharmacy <- SharedData$new(activity_pharmacy_df, ~PharmacyCode, group = "pharmacy-group")
+shared_table <- SharedData$new(pharmacy_table, ~PharmacyCode, group = "pharmacy-group")
+
+# Prepare trend data
+names(trend_table) <- gsub("\\s+", ".", names(trend_table))
+if("Quarter" %in% names(trend_table)) {
+  trend_table$Quarter <- factor(trend_table$Quarter, 
+                               levels = unique(trend_table$Quarter[order(trend_table$Quarter)]))
+}
+
+shared_trend <- SharedData$new(trend_table, ~PharmacyCode, group = "pharmacy-group")
+
+# -------------------------------------------------------------------------
+# 5. CREATE LEGEND HTML - FIXED VISIBILITY
+# -------------------------------------------------------------------------
+postal_legend_html <- paste0(
+  '<div id="postal_legend" style="font-size:9px; line-height:1.2; padding: 4px; background: white;">',
+  '<strong style="font-size:10px;">Activity by Postal District</strong>',
+  '<div style="margin-top:2px;">',
+  paste0(
+    '<div style="display:flex; align-items:center; margin:3px 0;">',
+    '<span style="display:inline-block; width:', pd_sizes * 1.5, 'px; height:', pd_sizes * 1.5,
+    'px; border-radius:50%; background:#c994c7; margin-right:6px;"></span>',
+    round(head(pd_breaks, -1)), ' - ', round(tail(pd_breaks, -1)),
+    '</div>',
+    collapse = ''
+  ),
+  '</div></div>'
+)
+
+hub_legend_html <- paste0(
+  '<div id="lines_legend" style="font-size:9px; line-height:1.2; padding: 4px; background: white;">',
+  '<strong style="font-size:10px;">Patients per Line</strong>',
+  '<div style="margin-top:2px;">',
+  paste0(
+    '<div style="display:flex; align-items:center; margin:3px 0;">',
+    '<span style="display:inline-block; width:16px; height:', hub_sizes, 
+    'px; background:#e34a33; opacity:', hub_opacities, '; margin-right:6px;"></span>',
+    hub_labels,
+    '</div>',
+    collapse = ''
+  ),
+  '</div></div>'
+)
+
+pharmacy_legend_html <- paste0(
+  '<div id="pharmacy_legend" style="font-size:9px; line-height:1.2; padding: 4px; background: white;">',
+  '<strong style="font-size:10px;">Activity by Pharmacies</strong>',
+  '<div style="margin-top:2px;">',
+  paste0(
+    '<div style="display:flex; align-items:center; margin:3px 0;">',
+    '<span style="display:inline-block; width:', ph_sizes * 1.5, 'px; height:', ph_sizes * 1.5,
+    'px; border-radius:50%; background:#2ca02c; border:2px solid white; margin-right:6px;"></span>',
+    round(head(ph_breaks, -1)), ' - ', round(tail(ph_breaks, -1)),
+    '</div>',
+    collapse = ''
+  ),
+  '</div></div>'
+)
+```
+
+Row {data-height=650}
+-----------------------------------------------------------------------
+
+```{r global-style, echo=FALSE}
+htmltools::tags$style(htmltools::HTML("
+  body {
+    padding: 30px;
+    background-color: #f8f9fa;
+  }
+
+  .leaflet, .datatables, .html-widget {
+    border-radius: 12px;
+    border: 1px solid #ddd;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+    margin-bottom: 25px;
+  }
+
+  /* Smaller Crosstalk filter slider */
+  .crosstalk-input.crosstalk-input-slider {
+    max-width: 250px !important;  /* adjust width */
+    font-size: 11px !important;   /* smaller text */
+    margin-bottom: 10px !important;
+  }
+
+  .crosstalk-input label {
+    font-weight: 500;
+    font-size: 12px;
+    margin-bottom: 2px;
+  }
+"))
+```
+
+### Interactive Map <span style="font-weight:bold; color:#468499;">(to reset all filters use the browser refresh button)</span>
+
+```{r style, echo=FALSE}
+htmltools::tags$style(htmltools::HTML("
+  /* Lift all bottom-right controls (legends etc.) above the attribution */
+  .leaflet-bottom.leaflet-right {
+    bottom: 55px !important;  /* try 50–60px until it aligns */
+  }
+
+  /* Optional: move the attribution text lower so it doesn't overlap */
+  .leaflet-control-attribution {
+    bottom: 0px !important;
+  }
+"))
+
+```
+
+
+```{r map}
+
+filter_slider(
+"activity_slider",
+"Pharmacy Activity Range:",
+shared_pharmacy,
+~PatientLinkID,
+step = 10,
+width = "300px"
+)
+
+# Create borough interior points for label placement
+borough_pts <- sf::st_point_on_surface(boroughs_nel) 
+
+# Create map - initialize with empty data for proper Crosstalk setup
+my_map <- leaflet(options = leafletOptions(scrollWheelZoom = FALSE)) %>%
+  addProviderTiles("Esri.WorldGrayCanvas") %>%
+  addPolygons(
+    data = boroughs_nel,
+    color = "#666666", weight = 1.5,
+    fillColor = "#cccccc", fillOpacity = 0.2, opacity = 1,
+    options = pathOptions(interactive = FALSE),
+    group = "Boroughs"
+  ) %>%
+  
+  # Borough labels
+  addLabelOnlyMarkers(
+    data = borough_pts,
+    label = ~lad20nm,
+    labelOptions = labelOptions(
+      noHide = TRUE,
+      textOnly = TRUE,
+      direction = "center",
+      className = "borough-label"
+    ),
+    group = "Boroughs"
+  ) %>%
+  
+  # IMD polygons - HIDDEN BY DEFAULT
+  addPolygons(
+    data = imd,
+    fillColor = ~imd_pal(MSOAQUINTI),
+    fillOpacity = 0.6,
+    color = "#444444",
+    weight = 0.3,
+    group = "IMD Quintiles",
+    options = pathOptions(interactive = FALSE)
+  ) %>% 
+  
+  # Hub lines - VISIBLE BY DEFAULT
+  addPolylines(
+    data = hub_lines,
+    weight = ~size,
+    color = "#e34a33",
+    opacity = ~opacity_level,
+    label = ~paste("Patients:", PatientLinkID),
+    group = "Hub Lines"
+  ) %>%
+  
+  # Postal District circle markers - VISIBLE BY DEFAULT
+  addCircleMarkers(
+    data = postal_district,
+    radius = ~circle_size,
+    fillColor = "#c994c7",
+    fillOpacity = 0.7,
+    color = "#ffffff",
+    weight = 1,
+    popup = ~paste0("<strong>Postal District: </strong>", PostDist,
+                    "<br><strong>Locale: </strong>", ifelse(is.na(Locale), "Unknown", Locale),
+                    "<br><strong>Patient Count: </strong>", PatientLinkID),
+    group = "Postal Districts"
+  ) %>%
+  
+  # Zero Activity Postal Districts - HIDDEN BY DEFAULT
+  addCircleMarkers(
+    data = post_dist_zero_act,
+    radius = 3,
+    fillColor = "#333333",
+    fillOpacity = 0.7,
+    color = "#ffffff",
+    weight = 1,
+    popup = ~paste0(
+      "<strong>Zero Activity District: </strong>", PostDist,
+      "<br><strong>Status: </strong>No Activity"
+    ),
+    group = "Zero Activity Districts"
+  ) %>%
+  
+  # PHARMACY CIRCLE MARKERS - USING SHARED DATA FOR CROSSTALK
+  addCircleMarkers(
+    data = shared_pharmacy,
+    lng = ~lng,
+    lat = ~lat,
+    radius = ~circle_radius,
+    fillColor = "#2ca02c",
+    fillOpacity = 0.8,
+    color = "#ffffff",
+    weight = 2,
+    stroke = TRUE,
+    popup = ~paste0(
+      "<strong>Pharmacy: </strong>", Pharmacy.Name, "<br>",
+      "<strong>Code: </strong>", PharmacyCode, "<br>",
+      "<strong>Activity: </strong>", PatientLinkID, "<br>",
+      "<strong>GP Referral: </strong>", ifelse(is.na(`GP Referral`), 0, `GP Referral`), "<br>",
+      "<strong>Walk In: </strong>", ifelse(is.na(`Walk In`), 0, `Walk In`)
+    ),
+    group = "Pharmacy Activity",
+    layerId = ~PharmacyCode
+  )
+
+# Add Zero Activity Pharmacies as circles - HIDDEN BY DEFAULT
+if(nrow(zero_activity_pharmacies) > 0) {
+  zero_activity_pharmacies <- zero_activity_pharmacies %>%
+    mutate(
+      lng = st_coordinates(.)[,1],
+      lat = st_coordinates(.)[,2]
+    )
+  
+  my_map <- my_map %>%
+    addCircleMarkers(
+      data = zero_activity_pharmacies,
+      lng = ~lng,
+      lat = ~lat,
+      radius = 3,
+      fillColor = "#ff0000",
+      fillOpacity = 0.7,
+      color = "#ffffff",
+      weight = 1,
+      popup = ~paste0("<strong>Pharmacy: </strong>", Pharmacy.Name),
+      group = "Zero Activity Pharmacies"
+    )
+}
+
+# Add legends and controls
+my_map <- my_map %>%
+  # IMD legend - will be controlled by JavaScript
+  addLegend(
+    position = "bottomright",
+    pal = imd_pal,
+    values = imd$MSOAQUINTI,
+    title = "IMD Quintile",
+    opacity = 1,
+    layerId = "imd_legend",
+    group = "IMD Quintiles"
+  ) %>%
+  # Custom legends - VISIBLE BY DEFAULT for active layers
+  addControl(
+    html = postal_legend_html,
+    position = "topleft"
+  ) %>%
+  addControl(
+    html = hub_legend_html,
+    position = "topleft"
+  ) %>%
+  addControl(
+    html = pharmacy_legend_html,
+    position = "topleft"
+  ) %>%
+  addControl(
+    html = '<div id="zero_activity_post_legend" style="font-size:9px; line-height:1.2; display:none; padding: 4px; background: white; border-radius: 3px;">
+              <strong style="font-size:10px;">Zero Activity Districts</strong>
+              <div style="margin-top:2px;">
+                <div style="display:flex; align-items:center; margin:2px 0;"><span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#ff0000; opacity:0.7; border:1px solid #ffffff; margin-right:6px;"></span>No Activity</div>
+              </div>
+            </div>',
+    position = "bottomright"
+  ) %>%
+  
+  addControl(
+    html = '<div id="zero_activity_pharm_legend" style="font-size:9px; line-height:1.2; display:none; padding: 4px; background: white; border-radius: 3px;">
+            <strong style="font-size:10px;">Zero Activity Pharmacies</strong>
+            <div style="margin-top:2px;">
+              <div style="display:flex; align-items:center; margin:2px 0;">
+                <span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#ff0000; opacity:0.7; border:1px solid #ffffff; margin-right:6px;"></span>
+                No Activity
+              </div>
+            </div>
+          </div>',
+    position = "bottomright"
+  ) %>%
+  
+  addLayersControl(
+    position = "topright",
+    overlayGroups = c("IMD Quintiles", "Hub Lines", "Postal Districts", 
+                      "Pharmacy Activity", "Zero Activity Districts",
+                      "Zero Activity Pharmacies"),
+    options = layersControlOptions(collapsed = FALSE)
+  ) %>%
+  # Set initial visibility
+  hideGroup("IMD Quintiles") %>%
+  hideGroup("Zero Activity Districts") %>% 
+  hideGroup("Zero Activity Pharmacies") %>%
+  # Hide IMD legend initially since IMD layer is hidden
+  htmlwidgets::onRender("
+    function(el, x) {
+      var map = this;
+      
+      // Make the layers control smaller with custom CSS and style legends
+      var style = document.createElement('style');
+      style.innerHTML = '.leaflet-control-layers { font-size: 10px !important; } ' +
+                        '.leaflet-control-layers label { font-size: 10px !important; padding: 2px 4px !important; margin-bottom: 2px !important; } ' +
+                        '.leaflet-control-layers-overlays { padding: 4px 6px !important; } ' +
+                        '.leaflet-control-layers input[type=\"checkbox\"] { transform: scale(0.8); margin-right: 3px !important; } ' +
+                        '.leaflet-control { border: none !important; box-shadow: none !important; border-radius: 4px !important; padding: 4px !important; } ' +
+                        '.info.legend { border: none !important; box-shadow: none !important; border-radius: 4px !important; padding: 4px !important; font-size: 9px !important; line-height: 1.2 !important; }';
+      document.head.appendChild(style);
+      
+      // Completely disable scroll wheel zoom
+      map.scrollWheelZoom.disable();
+      
+      // Prevent scroll wheel from zooming the map
+      L.DomEvent.on(map.getContainer(), 'wheel', function(e) {
+        if (e.ctrlKey) {
+          // Allow zoom with Ctrl key
+          L.DomEvent.stop(e);
+          var delta = L.DomEvent.getWheelDelta(e);
+          if (delta > 0) {
+            map.zoomIn();
+          } else {
+            map.zoomOut();
+          }
+          
+          // Hide message if showing
+          var msg = document.getElementById('scroll-message');
+          if (msg) msg.style.display = 'none';
+        } else {
+          // Show message that Ctrl is needed
+          var scrollMessage = document.getElementById('scroll-message');
+          if (!scrollMessage) {
+            scrollMessage = document.createElement('div');
+            scrollMessage.id = 'scroll-message';
+            scrollMessage.innerHTML = 'Use Ctrl + scroll to zoom the map';
+            scrollMessage.style.cssText = 'position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(0,0,0,0.7); color: white; padding: 10px 20px; border-radius: 4px; z-index: 1000; display: none; pointer-events: none; font-size: 14px;';
+            el.appendChild(scrollMessage);
+          }
+          
+          scrollMessage.style.display = 'block';
+          clearTimeout(window.scrollMessageTimeout);
+          window.scrollMessageTimeout = setTimeout(function() {
+            scrollMessage.style.display = 'none';
+          }, 1500);
+        }
+      });
+      
+      // Hide IMD legend initially
+      var imdLegend = document.querySelector('.leaflet-control.leaflet-control-attribution + .leaflet-control.leaflet-legend');
+      if (imdLegend) {
+        imdLegend.style.display = 'none';
+      }
+      
+      // Show/hide legends based on layer visibility
+      map.on('overlayadd', function(e) {
+        if (e.name === 'IMD Quintiles') {
+          var imdLegend = document.querySelector('.leaflet-control.leaflet-control-attribution + .leaflet-control.leaflet-legend');
+          if (imdLegend) imdLegend.style.display = 'block';
+        }
+        if (e.name === 'Zero Activity Districts') {
+          document.getElementById('zero_activity_post_legend').style.display = 'block';
+        }
+        if (e.name === 'Zero Activity Pharmacies') {
+          document.getElementById('zero_activity_pharm_legend').style.display = 'block';
+        }
+      });
+      
+      map.on('overlayremove', function(e) {
+        if (e.name === 'IMD Quintiles') {
+          var imdLegend = document.querySelector('.leaflet-control.leaflet-control-attribution + .leaflet-control.leaflet-legend');
+          if (imdLegend) imdLegend.style.display = 'none';
+        }
+        if (e.name === 'Zero Activity Districts') {
+          document.getElementById('zero_activity_post_legend').style.display = 'none';
+        }
+        if (e.name === 'Zero Activity Pharmacies') {
+          document.getElementById('zero_activity_pharm_legend').style.display = 'none';
+        }
+      });
+      
+      // Enhanced Crosstalk integration
+      var ct = null;
+      setTimeout(function() {
+        ct = HTMLWidgets.find('#' + el.id).getSelectionHandle();
+      }, 100);
+      
+      // Handle marker clicks for filtering
+      map.eachLayer(function(layer) {
+        if (layer.options && layer.options.layerId) {
+          layer.on('click', function(e) {
+            if (ct) {
+              ct.set([layer.options.layerId]);
+              // Highlight the clicked marker
+              layer.setStyle({fillColor: '#ff9900', color: '#ff9900'});
+            }
+          });
+        }
+      });
+      
+      // Clear selection when clicking on map (not on markers)
+      map.on('click', function(e) {
+        if (ct && !e.originalEvent.propagatedFromMarker) {
+          ct.set([]);
+          // Reset all marker styles
+          map.eachLayer(function(layer) {
+            if (layer.options && layer.options.layerId) {
+              layer.setStyle({fillColor: '#2ca02c', color: '#ffffff'});
+            }
+          });
+        }
+      });
+      
+      // RESPONSIVE RESIZE HANDLER FOR MAP
+      window.addEventListener('resize', function() {
+        setTimeout(function() {
+          map.invalidateSize();
+        }, 100);
+      });
+    }
+  ") %>%
+  setView(lng = 0.085, lat = 51.56, zoom = 11)
+
+my_map
+```
+
+Row {data-height=500}
+----------------------------------------------------------------------
+
+### Pharmacy Details {data-width=500}
+
+
+```{r table}
+filter_select("pharmacy_filter", "Select Pharmacy:", shared_table, ~Pharmacy.Name, multiple = FALSE)
+
+DT::datatable(
+  shared_table,
+  options = list(
+    pageLength = 50, 
+    scrollY = "550px",
+    scrollX = TRUE,
+    dom = 't',
+    headerCallback = JS(
+      "function(thead, data, start, end, display) {",
+      "  $(thead).css('font-size', '11px');",
+      "}"
+    )
+  ),
+  rownames = FALSE,
+  class = 'compact stripe'
+) %>% 
+  DT::formatStyle(columns = colnames(pharmacy_table), fontSize = '11px')
+```
+
+Row {data-height=450}
+----------------------------------------------------------------------
+### Quarterly Trend {data-width=500}
+
+```{r chart}
+if(all(c("Quarter", "Quarterly.Activity", "PharmacyCode") %in% names(trend_table))) {
+p <- plot_ly(shared_trend, 
+             x = ~Quarter, y = ~Quarterly.Activity,
+             color = I('#999999'),
+             type = 'scatter', mode = 'lines+markers',
+             line = list(width = 2, color = '#CCCCCC'),
+             marker = list(size = 6, opacity = 0.6),
+             hovertemplate = '<b>Quarter:</b> %{x}<br><b>Activity:</b> %{y}<br><extra></extra>') %>%
+  layout(
+    xaxis = list(
+      title = "", tickangle = -45,
+      tickfont = list(size = 10, color = "#777777"),
+      showline = TRUE, linecolor = "#AAAAAA",
+      zeroline = FALSE, gridcolor = "#EEEEEE"
+    ),
+    yaxis = list(
+      title = "Activity Count", titlefont = list(size = 11, color = "#333333"),
+      tickfont = list(size = 10, color = "#777777"),
+      showline = TRUE, linecolor = "#AAAAAA",
+      zeroline = FALSE, gridcolor = "#EEEEEE"
+    ),
+    plot_bgcolor = "white", paper_bgcolor = "white",
+    showlegend = FALSE, hovermode = 'closest'
+  ) %>%
+  config(displayModeBar = FALSE, responsive = TRUE) %>%
+  highlight(on = "plotly_click", off = "plotly_doubleclick",
+            color = '#007BFF', opacityDim = 0.1)
+
+  p
+} else {
+  plot_ly() %>%
+    add_annotations(text = "Trend data not available", 
+                   xref = "paper", yref = "paper",
+                   x = 0.5, y = 0.5, 
+                   showarrow = FALSE,
+                   font = list(size = 16)) %>%
+    layout(xaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE),
+           yaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE))
+}
+```
+
